@@ -20,11 +20,22 @@ typedef struct _Elf64File {
     char *strtab;
     char *base;
     int func_offset;
-    int ndyn;
+    // dynamic symbol
+    int ndynsym;
     Elf64_Sym *dynsym;
+    // dynamic link
+    int ndyn;
+    Elf64_Dyn *dyn;
+    // dependent so
+    struct _Elf64File *depend;
+    Elf64_Addr *got;
+    // external so
+    char *ex_so;
 } Elf64File, *Elf64FileRef;
 
 Elf64FileRef elf64_read(FILE *fp);
+void call_hello_add(Elf64FileRef ef);
+void handle_depend(Elf64FileRef ef);
 
 #ifdef __cplusplus
 }

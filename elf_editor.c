@@ -132,7 +132,7 @@ static void load_dynsym(Elf64FileRef ef, FILE *fp)
             assert(shdr->sh_entsize == sizeof(Elf64_Sym));
             print_dynsym(sym, sz, ef);
             ef->dynsym = sym;
-            ef->ndyn = sz;
+            ef->ndynsym = sz;
         }
     }
 }
@@ -145,26 +145,55 @@ static void print_rela(Elf64_Rela *rela, int sz, Elf64FileRef ef)
         printf("[%d]: offset: 0x%lx, info: 0x%lx, added: 0x%lx, type: %lx, sym: 0x%lx\n", i,
                ra->r_offset, ra->r_info, ra->r_addend, ELF64_R_TYPE(ra->r_info),
                ELF64_R_SYM(ra->r_info));
+        Elf64_Sym *sym = NULL;
         if (ELF64_R_TYPE(ra->r_info) == R_X86_64_GLOB_DAT) {
-            Elf64_Sym *sym = ef->dynsym + ELF64_R_SYM(ra->r_info);
-            if (sym->st_value) {
-                // .got
-                Elf64_Addr *got = (Elf64_Addr *)(ef->base + ra->r_offset);
-                printf("sym:%s, addr: 0x%lx, got: %p\n", ef->strtab + sym->st_name, sym->st_value,
-                       got);
-                *got = (Elf64_Addr)(ef->base + sym->st_value);
-            }
+            sym = ef->dynsym + ELF64_R_SYM(ra->r_info);
+            // .got
+            // .rela.dyn
+            // variable
         }
 
         if (ELF64_R_TYPE(ra->r_info) == R_X86_64_JUMP_SLOT) {
-            Elf64_Sym *sym = ef->dynsym + ELF64_R_SYM(ra->r_info);
-            if (sym->st_value) {
-                // got.plt
-                Elf64_Addr *got = (Elf64_Addr *)(ef->base + ra->r_offset);
-                printf("sym:%s, addr: 0x%lx, got.plt: %p\n", ef->strtab + sym->st_name,
-                       sym->st_value, got);
-                *got = (Elf64_Addr)(ef->base + sym->st_value);
-            }
+            sym = ef->dynsym + ELF64_R_SYM(ra->r_info);
+            // .got.plt
+            // .rela.plt
+            // function
+        }
+
+        if (sym == NULL) continue;
+
+        switch (ELF64_ST_TYPE(sym->st_info)) {
+            case STT_FUNC:
+                if (sym->st_value) {
+                    Elf64_Addr *got = (Elf64_Addr *)(ef->base + ra->r_offset);
+                    *got = (Elf64_Addr)(ef->base + sym->st_value);
+                    printf("func sym:%s, addr: 0x%lx, got: %p\n", ef->strtab + sym->st_name,
+                           sym->st_value, got);
+                } else {
+                    // in other so
+                    printf("external func:%s, addr: 0x%lx\n", ef->strtab + sym->st_name,
+                           sym->st_value);
+                    Elf64FileRef fooef = elf64_read(fopen(ef->ex_so, "r"));
+                    Elf64_Addr *got = (Elf64_Addr *)(ef->base + ra->r_offset);
+                    ef->depend = fooef;
+                    ef->got = got;
+                    *got = (Elf64_Addr)(fooef->base + fooef->func_offset);
+                }
+                break;
+            case STT_OBJECT:
+                if (sym->st_value) {
+                    Elf64_Addr *got = (Elf64_Addr *)(ef->base + ra->r_offset);
+                    *got = (Elf64_Addr)(ef->base + sym->st_value);
+                    printf("var sym:%s, addr: 0x%lx, got: %p\n", ef->strtab + sym->st_name,
+                           sym->st_value, got);
+                } else {
+                    // in other so
+                    printf("external var:%s, addr: 0x%lx\n", ef->strtab + sym->st_name,
+                           sym->st_value);
+                }
+                break;
+            default:
+                break;
         }
     }
 }
@@ -176,6 +205,7 @@ static void load_rel_rela(Elf64FileRef ef, FILE *fp)
         shdr = ef->shdr + i;
         if (shdr->sh_type == SHT_RELA && shdr->sh_addr) {
             //.rela.dyn
+            //.rela.plt
             Elf64_Rela *rela;
             int sz = shdr->sh_size / shdr->sh_entsize;
             rela = malloc(shdr->sh_size);
@@ -216,7 +246,8 @@ static void load_anon(Elf64FileRef ef, FILE *fp)
     Elf64_Phdr *phdr;
     for (int i = 0; i < PH_SIZE(ef); i++) {
         phdr = ef->phdr + i;
-        if (phdr->p_type != PT_LOAD && phdr->p_type != PT_TLS) continue;
+        if (phdr->p_type != PT_LOAD && phdr->p_type != PT_TLS && phdr->p_type != PT_DYNAMIC)
+            continue;
         if (phdr->p_vaddr < min_va) min_va = phdr->p_vaddr;
         if (phdr->p_vaddr + phdr->p_memsz > max_va) max_va = phdr->p_vaddr + phdr->p_memsz;
         printf("min_va:0x%lx, max_va:0x%lx\n", min_va, max_va);
@@ -250,7 +281,8 @@ static void load_anon(Elf64FileRef ef, FILE *fp)
     int iseg = 0;
     for (int i = 0; i < PH_SIZE(ef); i++) {
         phdr = ef->phdr + i;
-        if (phdr->p_type != PT_LOAD && phdr->p_type != PT_TLS) continue;
+        if (phdr->p_type != PT_LOAD && phdr->p_type != PT_TLS && phdr->p_type != PT_DYNAMIC)
+            continue;
         off = phdr->p_vaddr & ALIGN;
         start = dyn ? (unsigned long)base : 0;
         start += TRUNC_PG(phdr->p_vaddr);
@@ -285,7 +317,36 @@ static void load_anon(Elf64FileRef ef, FILE *fp)
     }
 }
 
-static void call_hello_add(Elf64FileRef ef)
+static void print_dynamic(Elf64FileRef ef)
+{
+    Elf64_Dyn *dyn;
+    for (int i = 0; i < ef->ndyn; i++) {
+        dyn = ef->dyn + i;
+        printf("dynamic: 0x%lx, val/addr: 0x%lx\n", dyn->d_tag, dyn->d_un.d_ptr);
+        if (dyn->d_tag == DT_NEEDED) {
+            printf("DT_NEEDED:%s\n", ef->strtab + dyn->d_un.d_val);
+            ef->ex_so = ef->strtab + dyn->d_un.d_val;
+        }
+    }
+}
+
+static void load_dynamic(Elf64FileRef ef, FILE *fp)
+{
+    Elf64_Shdr *shdr;
+    for (int i = 0; i < SH_SIZE(ef); i++) {
+        shdr = ef->shdr + i;
+        if (shdr->sh_type == SHT_DYNAMIC && shdr->sh_addr) {
+            //.dynamic
+            ef->dyn = (Elf64_Dyn *)(ef->base + shdr->sh_addr);
+            ef->ndyn = shdr->sh_size / shdr->sh_entsize;
+            assert(shdr->sh_entsize == sizeof(Elf64_Dyn));
+            printf("dynmaic: %p, size: %d\n", ef->dyn, ef->ndyn);
+            print_dynamic(ef);
+        }
+    }
+}
+
+void call_hello_add(Elf64FileRef ef)
 {
     int dyn = IS_DNY(ef);
     if (dyn) {
@@ -299,17 +360,26 @@ static void call_hello_add(Elf64FileRef ef)
     }
 }
 
+void handle_depend(Elf64FileRef ef)
+{
+    if (ef->depend && ef->got) {
+        printf("dependent: libfoo.so\n");
+        Elf64_Addr *got = ef->got;
+        //*got = (Elf64_Addr)(ef->depend->base + ef->depend->func_offset);
+    }
+}
+
 Elf64FileRef elf64_read(FILE *fp)
 {
-    Elf64FileRef ef = malloc(sizeof(Elf64File));
+    Elf64FileRef ef = calloc(1, sizeof(Elf64File));
     read_ehdr(ef, fp);
     read_phdr(ef, fp);
     read_shdr(ef, fp);
     load_anon(ef, fp);
     load_strtab(ef, fp);
     load_dynsym(ef, fp);
+    load_dynamic(ef, fp);
     load_rel_rela(ef, fp);
-    call_hello_add(ef);
     return ef;
 }
 
